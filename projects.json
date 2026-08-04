@@ -1,7 +1,7 @@
 [
   {
     "name": "BlinkReminder",
-    "path": "/Users/ruslan_zeynalov/My developed soft/BlinkReminder",
+    "path": "/Users/ruslan_zeynalov/My soft/BlinkReminder",
     "pushRecipe": "blink-push",
     "buildRecipe": "blink-release",
     "buildLabel": "Собрать",
@@ -11,7 +11,7 @@
   },
   {
     "name": "Music",
-    "path": "/Users/ruslan_zeynalov/My developed soft/Music",
+    "path": "/Users/ruslan_zeynalov/My soft/Music",
     "pushRecipe": "music-push",
     "buildRecipe": "music-release",
     "buildLabel": "Собрать Docker",
@@ -19,7 +19,7 @@
   },
   {
     "name": "RuSwitcher",
-    "path": "/Users/ruslan_zeynalov/My developed soft/RuSwither",
+    "path": "/Users/ruslan_zeynalov/My soft/RuSwither",
     "pushRecipe": "ruswitcher-push",
     "buildRecipe": "ruswitcher-release",
     "buildLabel": "Собрать",
@@ -29,7 +29,7 @@
   },
   {
     "name": "Telegram Job Agent",
-    "path": "/Users/ruslan_zeynalov/My developed soft/Telegram work finder",
+    "path": "/Users/ruslan_zeynalov/My soft/Telegram work finder",
     "pushRecipe": "telegram-push",
     "buildRecipe": "telegram-release",
     "buildLabel": "Собрать",
@@ -39,7 +39,7 @@
   },
   {
     "name": "Avito Monitor",
-    "path": "/Users/ruslan_zeynalov/My developed soft/avito monitor 2",
+    "path": "/Users/ruslan_zeynalov/My soft/avito monitor 2",
     "pushRecipe": "avito-push",
     "buildRecipe": "avito-release",
     "buildLabel": "Собрать Docker",
@@ -47,7 +47,7 @@
   },
   {
     "name": "codex_push",
-    "path": "/Users/ruslan_zeynalov/My developed soft/codex_push",
+    "path": "/Users/ruslan_zeynalov/My soft/codex_push",
     "pushRecipe": "codex-push",
     "buildRecipe": "codex-install",
     "buildLabel": "Установить",
@@ -55,7 +55,7 @@
   },
   {
     "name": "HH Aggregator",
-    "path": "/Users/ruslan_zeynalov/My developed soft/hh-aggregator",
+    "path": "/Users/ruslan_zeynalov/My soft/hh-aggregator",
     "pushRecipe": "hh-push",
     "buildRecipe": "hh-prepare",
     "buildLabel": "Подготовить",
@@ -63,7 +63,7 @@
   },
   {
     "name": "Ideas",
-    "path": "/Users/ruslan_zeynalov/My developed soft/Ideas",
+    "path": "/Users/ruslan_zeynalov/My soft/Ideas",
     "pushRecipe": "ideas-push",
     "buildRecipe": "ideas-check",
     "buildLabel": "Проверить",
@@ -71,7 +71,7 @@
   },
   {
     "name": "Hybrid HH",
-    "path": "/Users/ruslan_zeynalov/My developed soft/hybrid-hh",
+    "path": "/Users/ruslan_zeynalov/My soft/hybrid-hh",
     "pushRecipe": "hybrid-push",
     "buildRecipe": "hybrid-release",
     "buildLabel": "Собрать",
@@ -84,7 +84,7 @@
   },
   {
     "name": "Project Manager",
-    "path": "/Users/ruslan_zeynalov/My developed soft/Project Center",
+    "path": "/Users/ruslan_zeynalov/My soft/Project Center",
     "pushRecipe": "project-manager-push",
     "buildRecipe": "project-manager-build",
     "buildLabel": "Собрать",

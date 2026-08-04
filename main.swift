@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 
 private struct ProjectDefinition: Decodable {
     let name: String
@@ -11,6 +12,7 @@ private struct ProjectDefinition: Decodable {
 
 private struct GitSnapshot {
     let isRepository: Bool
+    let hasAgentsInstructions: Bool
     let branch: String
     let isDetached: Bool
     let changedFiles: Int
@@ -19,6 +21,7 @@ private struct GitSnapshot {
     let upstream: String?
     let ahead: Int
     let behind: Int
+    let originCommitDate: Date?
     let version: String
     let error: String?
 }
@@ -43,9 +46,23 @@ private enum OperationKind: Equatable {
 
     var title: String {
         switch self {
-        case .push: return "Push"
+        case .push: return "Commit + Push"
         case .build: return "Build"
-        case .pushAndBuild: return "Push + Build"
+        case .pushAndBuild: return "Build + Commit + Push"
+        }
+    }
+}
+
+private enum OperationOutcome: Equatable {
+    case succeeded
+    case failed
+    case skipped
+
+    var title: String {
+        switch self {
+        case .succeeded: return "успех"
+        case .failed: return "ошибка"
+        case .skipped: return "не выполнено"
         }
     }
 }
@@ -53,9 +70,13 @@ private enum OperationKind: Equatable {
 private final class ProjectCard {
     let project: ProjectDefinition
     let container: NSBox
+    let heightConstraint: NSLayoutConstraint
+    let agentsIndicator: NSView
     let titleLabel: NSTextField
     let gitLabel: NSTextField
+    let originCommitLabel: NSTextField
     let lastOperationLabel: NSTextField
+    let lastOperationDateLabel: NSTextField
     let pushButton: NSButton
     let buildButton: NSButton
     let pushAndBuildButton: NSButton
@@ -67,9 +88,13 @@ private final class ProjectCard {
     init(
         project: ProjectDefinition,
         container: NSBox,
+        heightConstraint: NSLayoutConstraint,
+        agentsIndicator: NSView,
         titleLabel: NSTextField,
         gitLabel: NSTextField,
+        originCommitLabel: NSTextField,
         lastOperationLabel: NSTextField,
+        lastOperationDateLabel: NSTextField,
         pushButton: NSButton,
         buildButton: NSButton,
         pushAndBuildButton: NSButton,
@@ -78,9 +103,13 @@ private final class ProjectCard {
     ) {
         self.project = project
         self.container = container
+        self.heightConstraint = heightConstraint
+        self.agentsIndicator = agentsIndicator
         self.titleLabel = titleLabel
         self.gitLabel = gitLabel
+        self.originCommitLabel = originCommitLabel
         self.lastOperationLabel = lastOperationLabel
+        self.lastOperationDateLabel = lastOperationDateLabel
         self.pushButton = pushButton
         self.buildButton = buildButton
         self.pushAndBuildButton = pushAndBuildButton
@@ -160,7 +189,7 @@ private final class CommandRunner {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
     private let commandRunner = CommandRunner()
     private let operationQueue = DispatchQueue(label: "com.ruslan.project-center.operations", qos: .userInitiated)
     private let fileManager = FileManager.default
@@ -180,11 +209,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var logTextView: NSTextView!
     private var copyLogButton: NSButton!
     private var taskLog = ""
+    private var zoomEventMonitor: Any?
+    private var zoomableControls: [(NSControl, NSFont)] = []
+    private var zoomableTextViews: [(NSTextView, NSFont)] = []
+    private var interfaceZoom: CGFloat = 1
+
+    private let minimumInterfaceZoom: CGFloat = 0.8
+    private let maximumInterfaceZoom: CGFloat = 1.5
+    private let interfaceZoomStep: CGFloat = 0.1
+
+    private let originCommitDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateFormat = "dd.MM.yyyy HH:mm"
+        return formatter
+    }()
+
+    private let lastOperationDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ru_RU")
+        formatter.dateFormat = "dd.MM.yyyy HH:mm"
+        return formatter
+    }()
+
+    private let minimumProjectPaneHeight: CGFloat = 150
+    private let minimumLogPanelHeight: CGFloat = 120
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         loadConfiguration()
         buildWindow()
+        installZoomKeyboardShortcuts()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
@@ -199,10 +254,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        if let zoomEventMonitor {
+            NSEvent.removeMonitor(zoomEventMonitor)
+        }
+    }
+
     private func loadConfiguration() {
         let home = fileManager.homeDirectoryForCurrentUser
         let sourceURL = home
-            .appendingPathComponent("My developed soft", isDirectory: true)
+            .appendingPathComponent("My soft", isDirectory: true)
             .appendingPathComponent("Project Center", isDirectory: true)
             .appendingPathComponent("projects.json")
         let bundledURL = Bundle.main.url(forResource: "projects", withExtension: "json")
@@ -250,19 +311,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let content = NSView()
         window.contentView = content
 
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 12
-        root.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(root)
+        // A split view provides the native draggable divider between the
+        // projects and the task log. Project cards stay available in a scroll
+        // view when the user gives more vertical space to the log.
+        let splitView = NSSplitView()
+        splitView.isVertical = false
+        splitView.dividerStyle = .thin
+        splitView.delegate = self
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(splitView)
 
         NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
-            root.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
-            root.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
-            root.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
+            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            splitView.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            splitView.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
         ])
+
+        let projectPane = NSView()
 
         let header = NSStackView()
         header.orientation = .horizontal
@@ -276,17 +342,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let title = NSTextField(labelWithString: "Push & Build Commander")
         title.font = .systemFont(ofSize: 22, weight: .bold)
+        registerZoomable(title)
         headingStack.addArrangedSubview(title)
 
-        let subtitle = NSTextField(labelWithString: "Текущая ветка · без auto-commit и force · сборки через общий justfile")
+        let subtitle = NSTextField(labelWithString: "Push автоматически фиксирует все изменения · без force · сборки через общий justfile")
         subtitle.textColor = .secondaryLabelColor
         subtitle.font = .systemFont(ofSize: 12)
+        registerZoomable(subtitle)
         headingStack.addArrangedSubview(subtitle)
 
         statusLabel = NSTextField(labelWithString: "Готово")
         statusLabel.font = .systemFont(ofSize: 11, weight: .medium)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
+        registerZoomable(statusLabel)
         headingStack.addArrangedSubview(statusLabel)
         header.addArrangedSubview(headingStack)
 
@@ -300,10 +369,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         refreshButton = NSButton(title: "Обновить", target: self, action: #selector(refreshStatuses(_:)))
         refreshButton.bezelStyle = .rounded
+        registerZoomable(refreshButton)
         header.addArrangedSubview(refreshButton)
 
-        root.addArrangedSubview(header)
-        header.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        header.translatesAutoresizingMaskIntoConstraints = false
+        projectPane.addSubview(header)
 
         projectStack = NSStackView()
         projectStack.orientation = .vertical
@@ -318,25 +388,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             card.container.widthAnchor.constraint(equalTo: projectStack.widthAnchor).isActive = true
         }
 
-        root.addArrangedSubview(projectStack)
-        projectStack.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        let projectScrollView = NSScrollView()
+        projectScrollView.borderType = .noBorder
+        projectScrollView.hasVerticalScroller = true
+        projectScrollView.autohidesScrollers = true
+        projectScrollView.drawsBackground = false
+        projectScrollView.documentView = projectStack
+        projectScrollView.translatesAutoresizingMaskIntoConstraints = false
+        projectPane.addSubview(projectScrollView)
 
-        let taskLogPanel = makeTaskLogPanel(height: logPanelHeight)
-        root.addArrangedSubview(taskLogPanel)
-        taskLogPanel.widthAnchor.constraint(equalTo: root.widthAnchor).isActive = true
+        NSLayoutConstraint.activate([
+            header.leadingAnchor.constraint(equalTo: projectPane.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: projectPane.trailingAnchor),
+            header.topAnchor.constraint(equalTo: projectPane.topAnchor),
+            projectScrollView.leadingAnchor.constraint(equalTo: projectPane.leadingAnchor),
+            projectScrollView.trailingAnchor.constraint(equalTo: projectPane.trailingAnchor),
+            projectScrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 12),
+            projectScrollView.bottomAnchor.constraint(equalTo: projectPane.bottomAnchor),
+            projectStack.leadingAnchor.constraint(equalTo: projectScrollView.contentView.leadingAnchor),
+            projectStack.trailingAnchor.constraint(equalTo: projectScrollView.contentView.trailingAnchor),
+            projectStack.topAnchor.constraint(equalTo: projectScrollView.contentView.topAnchor),
+            projectStack.widthAnchor.constraint(equalTo: projectScrollView.contentView.widthAnchor)
+        ])
+        projectStack.setContentHuggingPriority(.required, for: .vertical)
+        projectStack.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        let taskLogPanel = makeTaskLogPanel()
+        splitView.addArrangedSubview(projectPane)
+        splitView.addArrangedSubview(taskLogPanel)
+
+        // NSSplitView uses physical coordinates for the divider. Depending on
+        // the subview ordering used by AppKit, the first pane can be above or
+        // below the divider, so determine the matching initial position after
+        // its first layout pass.
+        let projectPaneHeight = minimumContentHeight - 32 - logPanelHeight - splitView.dividerThickness
+        DispatchQueue.main.async {
+            splitView.layoutSubtreeIfNeeded()
+            let firstPaneIsAboveDivider = projectPane.frame.minY > 0
+            let dividerPosition = firstPaneIsAboveDivider ? logPanelHeight : projectPaneHeight
+            splitView.setPosition(dividerPosition, ofDividerAt: 0)
+        }
     }
 
-    private func makeTaskLogPanel(height: CGFloat) -> NSBox {
+    private func makeTaskLogPanel() -> NSBox {
         let box = NSBox()
         box.boxType = .custom
         box.borderWidth = 1
         box.borderColor = NSColor.separatorColor
         box.cornerRadius = 8
         box.fillColor = NSColor(calibratedWhite: 0.13, alpha: 1)
-        box.heightAnchor.constraint(equalToConstant: height).isActive = true
-
         let content = NSView()
-        content.translatesAutoresizingMaskIntoConstraints = false
+        // NSBox owns the frame of its content view. Keeping the autoresizing
+        // mask here lets the content fill the box; disabling it without
+        // replacement constraints collapses the scroll view for the logs.
+        content.autoresizingMask = [.width, .height]
         box.contentView = content
 
         let header = NSStackView()
@@ -353,11 +458,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let title = NSTextField(labelWithString: "Логи задачи")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
+        registerZoomable(title)
         labels.addArrangedSubview(title)
 
         let hint = NSTextField(labelWithString: "Полный вывод последнего Push или Build")
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .tertiaryLabelColor
+        registerZoomable(hint)
         labels.addArrangedSubview(hint)
         header.addArrangedSubview(labels)
         header.addArrangedSubview(NSView())
@@ -366,6 +473,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         copyLogButton.bezelStyle = .rounded
         copyLogButton.controlSize = .small
         copyLogButton.isEnabled = false
+        registerZoomable(copyLogButton)
         header.addArrangedSubview(copyLogButton)
 
         let textView = NSTextView()
@@ -384,6 +492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         textView.textContainer?.widthTracksTextView = true
         textView.string = "Здесь появится полный вывод следующей задачи."
         logTextView = textView
+        registerZoomable(textView)
 
         let scrollView = NSScrollView()
         scrollView.borderType = .bezelBorder
@@ -407,6 +516,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return box
     }
 
+    func splitView(
+        _ splitView: NSSplitView,
+        constrainSplitPosition proposedPosition: CGFloat,
+        ofSubviewAt dividerIndex: Int
+    ) -> CGFloat {
+        guard
+            !splitView.isVertical,
+            dividerIndex == 0,
+            let projectPane = splitView.arrangedSubviews.first
+        else {
+            return proposedPosition
+        }
+
+        let projectPaneIsAboveDivider = projectPane.frame.minY > 0
+        let lowerPaneMinimum = projectPaneIsAboveDivider
+            ? minimumLogPanelHeight
+            : minimumProjectPaneHeight
+        let upperPaneMinimum = projectPaneIsAboveDivider
+            ? minimumProjectPaneHeight
+            : minimumLogPanelHeight
+        let maximumPosition = splitView.bounds.height - splitView.dividerThickness - upperPaneMinimum
+
+        return min(max(proposedPosition, lowerPaneMinimum), maximumPosition)
+    }
+
     private func makeCard(_ project: ProjectDefinition, index: Int) -> ProjectCard {
         let box = NSBox()
         box.boxType = .custom
@@ -427,36 +561,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         labels.alignment = .leading
         labels.spacing = 2
 
+        let agentsIndicator = NSView()
+        agentsIndicator.wantsLayer = true
+        agentsIndicator.layer?.backgroundColor = NSColor.systemRed.cgColor
+        agentsIndicator.layer?.cornerRadius = 4
+        agentsIndicator.toolTip = "В корне проекта нет AGENTS.md"
+        agentsIndicator.isHidden = true
+        agentsIndicator.widthAnchor.constraint(equalToConstant: 8).isActive = true
+        agentsIndicator.heightAnchor.constraint(equalToConstant: 8).isActive = true
+
         let titleLabel = NSTextField(labelWithString: "\(project.name)   версия —")
         titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         titleLabel.lineBreakMode = .byTruncatingTail
-        labels.addArrangedSubview(titleLabel)
+        registerZoomable(titleLabel)
+
+        let titleRow = NSStackView(views: [agentsIndicator, titleLabel])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 6
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        labels.addArrangedSubview(titleRow)
 
         let gitLabel = NSTextField(labelWithString: "Статус обновляется…")
         gitLabel.font = .systemFont(ofSize: 12)
         gitLabel.textColor = .secondaryLabelColor
         gitLabel.lineBreakMode = .byTruncatingTail
-        labels.addArrangedSubview(gitLabel)
+        registerZoomable(gitLabel)
+
+        let originCommitLabel = NSTextField(labelWithString: "")
+        originCommitLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        originCommitLabel.lineBreakMode = .byTruncatingTail
+        originCommitLabel.isHidden = true
+        originCommitLabel.wantsLayer = true
+        registerZoomable(originCommitLabel)
+
+        let gitStatusRow = NSStackView(views: [gitLabel, originCommitLabel])
+        gitStatusRow.orientation = .horizontal
+        gitStatusRow.alignment = .centerY
+        gitStatusRow.spacing = 10
+        gitLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        originCommitLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        labels.addArrangedSubview(gitStatusRow)
 
         let lastOperationLabel = NSTextField(labelWithString: "Последняя операция: —")
         lastOperationLabel.font = .systemFont(ofSize: 11)
         lastOperationLabel.textColor = .tertiaryLabelColor
         lastOperationLabel.lineBreakMode = .byTruncatingTail
-        labels.addArrangedSubview(lastOperationLabel)
+        registerZoomable(lastOperationLabel)
+
+        let lastOperationDateLabel = NSTextField(labelWithString: "")
+        lastOperationDateLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        lastOperationDateLabel.textColor = .tertiaryLabelColor
+        lastOperationDateLabel.lineBreakMode = .byTruncatingTail
+        lastOperationDateLabel.isHidden = true
+        lastOperationDateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        registerZoomable(lastOperationDateLabel)
+
+        let lastOperationRow = NSStackView(views: [lastOperationLabel, NSView(), lastOperationDateLabel])
+        lastOperationRow.orientation = .horizontal
+        lastOperationRow.alignment = .centerY
+        lastOperationRow.spacing = 8
+        lastOperationLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        labels.addArrangedSubview(lastOperationRow)
+        lastOperationRow.widthAnchor.constraint(equalTo: labels.widthAnchor).isActive = true
         labels.setContentHuggingPriority(.defaultLow, for: .horizontal)
         labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         row.addArrangedSubview(labels)
 
         row.addArrangedSubview(NSView())
 
-        let pushButton = actionButton(title: "Push", selector: #selector(pushProject(_:)), index: index)
+        let pushButton = actionButton(title: "Commit + Push", selector: #selector(pushProject(_:)), index: index)
         pushButton.contentTintColor = .systemOrange
+        pushButton.toolTip = "Зафиксировать все изменения и отправить их в origin"
         row.addArrangedSubview(pushButton)
 
         let buildButton = actionButton(title: project.buildLabel, selector: #selector(buildProject(_:)), index: index)
         row.addArrangedSubview(buildButton)
 
-        let combinedButton = actionButton(title: "Push + Build", selector: #selector(pushAndBuildProject(_:)), index: index)
+        let combinedButton = actionButton(title: "Build + Commit + Push", selector: #selector(pushAndBuildProject(_:)), index: index)
+        combinedButton.toolTip = "Сначала собрать проект, затем зафиксировать все изменения и отправить их в origin"
         row.addArrangedSubview(combinedButton)
 
         let launchButton = actionButton(title: "Запуск", selector: #selector(launchArtifact(_:)), index: index)
@@ -467,13 +650,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         revealArtifactButton.toolTip = "Показать последнюю сборку в Finder"
         row.addArrangedSubview(revealArtifactButton)
 
-        box.heightAnchor.constraint(equalToConstant: 64).isActive = true
+        let heightConstraint = box.heightAnchor.constraint(equalToConstant: 64)
+        heightConstraint.isActive = true
         return ProjectCard(
             project: project,
             container: box,
+            heightConstraint: heightConstraint,
+            agentsIndicator: agentsIndicator,
             titleLabel: titleLabel,
             gitLabel: gitLabel,
+            originCommitLabel: originCommitLabel,
             lastOperationLabel: lastOperationLabel,
+            lastOperationDateLabel: lastOperationDateLabel,
             pushButton: pushButton,
             buildButton: buildButton,
             pushAndBuildButton: combinedButton,
@@ -488,6 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.controlSize = .small
         button.tag = index
         button.isEnabled = false
+        registerZoomable(button)
         return button
     }
 
@@ -552,116 +741,164 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isBusy, cards.indices.contains(projectIndex) else { return }
         let card = cards[projectIndex]
 
-        if kind != .build {
-            guard let snapshot = card.snapshot, snapshot.isRepository else {
-                blockOperation(
-                    kind,
-                    for: card,
-                    message: "Push недоступен: проект не является Git-репозиторием."
-                )
-                return
-            }
-            guard !snapshot.isDetached else {
-                blockOperation(
-                    kind,
-                    for: card,
-                    message: "Push недоступен: HEAD не привязан к ветке."
-                )
-                return
-            }
-            guard snapshot.hasCommit else {
-                blockOperation(
-                    kind,
-                    for: card,
-                    message: "Push недоступен: в репозитории ещё нет ни одного коммита."
-                )
-                return
-            }
-            guard snapshot.hasOrigin else {
-                blockOperation(
-                    kind,
-                    for: card,
-                    message: "Push недоступен: не настроен remote origin."
-                )
-                return
-            }
-        }
-
         setBusy(true, status: "\(kind.title): \(card.project.name)…")
         setTaskLog(
-            "\(kind.title) · \(card.project.name)\n\nЗадача запущена. Полный вывод появится после завершения команды."
+            "\(kind.title) · \(card.project.name)\n\nПроверяется актуальное состояние проекта."
         )
         let operationStartedAt = Date()
-        let recipes: [String]
-        switch kind {
-        case .push:
-            recipes = [card.project.pushRecipe]
-        case .build:
-            recipes = [card.project.buildRecipe]
-        case .pushAndBuild:
-            recipes = [card.project.pushRecipe, card.project.buildRecipe]
-        }
 
         operationQueue.async { [weak self] in
             guard let self else { return }
             var commandResults: [CommandResult] = []
+            var notes: [String] = []
+            var outcome: OperationOutcome = .failed
+            var message: String?
+            let snapshot: GitSnapshot
 
-            for recipe in recipes {
-                let result = self.runJustRecipe(recipe)
+            switch kind {
+            case .build:
+                let result = self.runJustRecipe(card.project.buildRecipe)
                 commandResults.append(result)
-                if !result.succeeded {
-                    break
+                snapshot = self.readSnapshot(for: card.project)
+                outcome = result.succeeded ? .succeeded : .failed
+
+            case .push:
+                var currentSnapshot = self.readSnapshot(for: card.project)
+
+                if let blockReason = self.pushBlockReason(for: currentSnapshot) {
+                    message = blockReason
+                    notes.append("Команда Push не была запущена.\nПричина: \(blockReason)")
+                    outcome = .failed
+                } else if let commitFailure = self.createAutomaticCommitIfNeeded(
+                    for: card.project,
+                    snapshot: currentSnapshot,
+                    commandResults: &commandResults,
+                    notes: &notes
+                ) {
+                    currentSnapshot = self.readSnapshot(for: card.project)
+                    message = commitFailure
+                    outcome = .failed
+                } else {
+                    currentSnapshot = self.readSnapshot(for: card.project)
+
+                    let pushExecution = self.pushPendingCommits(
+                        for: card.project,
+                        snapshot: &currentSnapshot,
+                        commandResults: &commandResults,
+                        notes: &notes
+                    )
+                    outcome = pushExecution.outcome
+                    message = pushExecution.message
                 }
+
+                snapshot = currentSnapshot
+
+            case .pushAndBuild:
+                var currentSnapshot = self.readSnapshot(for: card.project)
+
+                if let blockReason = self.pushBlockReason(for: currentSnapshot) {
+                    message = blockReason
+                    notes.append("Команды Build, Commit и Push не были запущены.\nПричина: \(blockReason)")
+                    outcome = .failed
+                } else {
+                    notes.append("Порядок операции: Build → Commit → Push.")
+                    let buildResult = self.runJustRecipe(card.project.buildRecipe)
+                    commandResults.append(buildResult)
+                    currentSnapshot = self.readSnapshot(for: card.project)
+
+                    if !buildResult.succeeded {
+                        outcome = .failed
+                    } else if let commitFailure = self.createAutomaticCommitIfNeeded(
+                        for: card.project,
+                        snapshot: currentSnapshot,
+                        commandResults: &commandResults,
+                        notes: &notes
+                    ) {
+                        currentSnapshot = self.readSnapshot(for: card.project)
+                        message = commitFailure
+                        outcome = .failed
+                    } else {
+                        currentSnapshot = self.readSnapshot(for: card.project)
+                        let pushExecution = self.pushPendingCommits(
+                            for: card.project,
+                            snapshot: &currentSnapshot,
+                            commandResults: &commandResults,
+                            notes: &notes
+                        )
+
+                        if pushExecution.outcome == .skipped {
+                            notes.append("Сборка выполнена; новых коммитов для отправки нет.")
+                            outcome = .succeeded
+                        } else {
+                            outcome = pushExecution.outcome
+                            message = pushExecution.message
+                        }
+                    }
+                }
+
+                snapshot = currentSnapshot
             }
 
-            let snapshot = self.readSnapshot(for: card.project)
             let artifact = self.latestArtifact(for: card.project)
             let totalDuration = Date().timeIntervalSince(operationStartedAt)
-            let succeeded = commandResults.count == recipes.count && commandResults.allSatisfy(\.succeeded)
+            let operationCompletedAt = Date()
             let failedResult = commandResults.first(where: { !$0.succeeded })
+            let statusMessage: String
+            switch outcome {
+            case .succeeded:
+                statusMessage = "Успешно: \(kind.title) · \(card.project.name)"
+            case .skipped:
+                statusMessage = message ?? "Операция не выполнена."
+            case .failed:
+                statusMessage = message ?? self.failureExplanation(for: failedResult, operation: kind)
+            }
 
             DispatchQueue.main.async {
                 self.apply(snapshot, artifact: artifact, to: card)
-                self.updateLastOperation(card, kind: kind, succeeded: succeeded, duration: totalDuration)
+                self.updateLastOperation(
+                    card,
+                    kind: kind,
+                    outcome: outcome,
+                    duration: totalDuration,
+                    completedAt: operationCompletedAt
+                )
                 self.setTaskLog(
                     self.operationLog(
                         kind: kind,
                         project: card.project,
                         results: commandResults,
-                        succeeded: succeeded,
+                        outcome: outcome,
+                        notes: notes,
                         duration: totalDuration
                     )
                 )
 
-                if succeeded {
-                    self.setStatus("Успешно: \(kind.title) · \(card.project.name)", color: .systemGreen)
-                } else {
-                    let explanation = self.failureExplanation(for: failedResult, operation: kind)
-                    self.setStatus("Ошибка: \(kind.title) · \(card.project.name) — \(explanation)", color: .systemRed)
+                switch outcome {
+                case .succeeded:
+                    self.setStatus(statusMessage, color: .systemGreen)
+                case .skipped:
+                    self.setStatus(statusMessage, color: .secondaryLabelColor)
+                case .failed:
+                    self.setStatus("Ошибка: \(kind.title) · \(card.project.name) — \(statusMessage)", color: .systemRed)
                 }
                 self.finishBusyState()
             }
         }
     }
 
-    private func blockOperation(_ kind: OperationKind, for card: ProjectCard, message: String) {
-        setTaskLog(
-            "\(kind.title) · \(card.project.name)\n\nКоманда не была запущена.\nПричина: \(message)"
-        )
-        showError(message)
-    }
-
     private func operationLog(
         kind: OperationKind,
         project: ProjectDefinition,
         results: [CommandResult],
-        succeeded: Bool,
+        outcome: OperationOutcome,
+        notes: [String],
         duration: TimeInterval
     ) -> String {
         var sections = [
             "\(kind.title) · \(project.name)",
-            "Результат: \(succeeded ? "успех" : "ошибка")\nДлительность: \(formatDuration(duration))"
+            "Результат: \(outcome.title)\nДлительность: \(formatDuration(duration))"
         ]
+        sections.append(contentsOf: notes)
 
         for (index, result) in results.enumerated() {
             var section = "Команда \(index + 1) из \(results.count)\n$ \(result.command)\nРабочая папка: \(result.workingDirectory)"
@@ -687,11 +924,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    private func pushBlockReason(for snapshot: GitSnapshot) -> String? {
+        guard snapshot.isRepository else {
+            return "Push недоступен: проект не является Git-репозиторием."
+        }
+        guard !snapshot.isDetached else {
+            return "Push недоступен: HEAD не привязан к ветке."
+        }
+        guard snapshot.hasCommit else {
+            return "Push недоступен: в репозитории ещё нет ни одного коммита."
+        }
+        guard snapshot.hasOrigin else {
+            return "Push недоступен: не настроен remote origin."
+        }
+        guard snapshot.upstream != nil else {
+            return "Push недоступен: для текущей ветки не настроен upstream."
+        }
+        return nil
+    }
+
+    private func pushPreparationNote(for snapshot: GitSnapshot) -> String {
+        let workingTreeStatus = snapshot.changedFiles == 0
+            ? "clean"
+            : "незакоммичено: \(snapshot.changedFiles)"
+        var lines = [
+            "Актуальный Git-статус перед Push: \(workingTreeStatus), ↑\(snapshot.ahead) ↓\(snapshot.behind).",
+            "Будут отправлены только \(snapshot.ahead) готовых коммитов."
+        ]
+        if snapshot.changedFiles > 0 {
+            lines.append("Push не будет запущен, пока все изменения не войдут в коммит.")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func pushPendingCommits(
+        for project: ProjectDefinition,
+        snapshot: inout GitSnapshot,
+        commandResults: inout [CommandResult],
+        notes: inout [String]
+    ) -> (outcome: OperationOutcome, message: String?) {
+        guard snapshot.ahead > 0 else {
+            let message: String
+            if snapshot.behind > 0 {
+                message = "Нечего отправлять: локальных коммитов для Push нет, но origin опережает ветку на \(snapshot.behind) коммитов. Сначала получите обновления."
+            } else {
+                message = "Нечего отправлять: локальная ветка уже совпадает с origin."
+            }
+            notes.append("Команда Push не была запущена.\nПричина: \(message)")
+            return (.skipped, message)
+        }
+
+        notes.append(pushPreparationNote(for: snapshot))
+        let pushResult = runJustRecipe(project.pushRecipe)
+        commandResults.append(pushResult)
+        snapshot = readSnapshot(for: project)
+
+        guard pushResult.succeeded else {
+            return (.failed, nil)
+        }
+        guard snapshot.upstream != nil else {
+            let message = "Push завершился без ошибки, но после него не удалось определить upstream для проверки результата."
+            notes.append(message)
+            return (.failed, message)
+        }
+        guard snapshot.ahead == 0 else {
+            let message = "Push завершился без ошибки, но осталось \(snapshot.ahead) неотправленных коммитов. Проверьте настройки remote/upstream и вывод команды."
+            notes.append(message)
+            return (.failed, message)
+        }
+        return (.succeeded, nil)
+    }
+
+    private func createAutomaticCommitIfNeeded(
+        for project: ProjectDefinition,
+        snapshot: GitSnapshot,
+        commandResults: inout [CommandResult],
+        notes: inout [String]
+    ) -> String? {
+        guard snapshot.changedFiles > 0 else {
+            return nil
+        }
+
+        notes.append("Подготовка автоматического коммита из \(snapshot.changedFiles) изменений.")
+        let addResult = runGit(["add", "-A"], in: URL(fileURLWithPath: project.path, isDirectory: true))
+        commandResults.append(addResult)
+        guard addResult.succeeded else {
+            return "Не удалось добавить изменения в коммит. Push не выполнялся."
+        }
+
+        let commitMessage = "Автоматический коммит из Project Center"
+        let commitResult = runGit(
+            ["commit", "-m", commitMessage],
+            in: URL(fileURLWithPath: project.path, isDirectory: true)
+        )
+        commandResults.append(commitResult)
+        guard commitResult.succeeded else {
+            return "Не удалось создать коммит. Push не выполнялся."
+        }
+
+        let updatedSnapshot = readSnapshot(for: project)
+        guard updatedSnapshot.changedFiles == 0 else {
+            return "После автоматического коммита остались незакоммиченные изменения. Push не выполнялся."
+        }
+
+        notes.append("Создан коммит: \(commitMessage).")
+        return nil
+    }
+
     private func readSnapshot(for project: ProjectDefinition) -> GitSnapshot {
         let directory = URL(fileURLWithPath: project.path, isDirectory: true)
         guard fileManager.fileExists(atPath: directory.path) else {
             return GitSnapshot(
                 isRepository: false,
+                hasAgentsInstructions: false,
                 branch: "путь не найден",
                 isDetached: false,
                 changedFiles: 0,
@@ -700,15 +1045,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 upstream: nil,
                 ahead: 0,
                 behind: 0,
+                originCommitDate: nil,
                 version: "—",
                 error: "Папка проекта не найдена"
             )
         }
 
+        let hasAgentsInstructions = hasAgentsInstructions(in: directory)
         let repoCheck = runGit(["rev-parse", "--is-inside-work-tree"], in: directory)
         guard repoCheck.succeeded, repoCheck.output.trimmingCharacters(in: .whitespacesAndNewlines) == "true" else {
             return GitSnapshot(
                 isRepository: false,
+                hasAgentsInstructions: hasAgentsInstructions,
                 branch: "не Git-репозиторий",
                 isDetached: false,
                 changedFiles: 0,
@@ -717,6 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 upstream: nil,
                 ahead: 0,
                 behind: 0,
+                originCommitDate: nil,
                 version: detectVersion(in: directory),
                 error: "Не Git-репозиторий"
             )
@@ -761,6 +1110,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         var ahead = 0
         var behind = 0
+        var originCommitDate: Date?
         if upstream != nil {
             let countsResult = runGit(
                 ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
@@ -771,10 +1121,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ahead = Int(parts[0]) ?? 0
                 behind = Int(parts[1]) ?? 0
             }
+
+            let originCommitResult = runGit(["log", "-1", "--format=%cI", "@{upstream}"], in: directory)
+            let originCommitDateText = originCommitResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            originCommitDate = originCommitResult.succeeded
+                ? ISO8601DateFormatter().date(from: originCommitDateText)
+                : nil
         }
 
         return GitSnapshot(
             isRepository: true,
+            hasAgentsInstructions: hasAgentsInstructions,
             branch: branch,
             isDetached: isDetached,
             changedFiles: changedFiles,
@@ -783,9 +1140,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             upstream: upstream,
             ahead: ahead,
             behind: behind,
+            originCommitDate: originCommitDate,
             version: detectVersion(in: directory),
             error: nil
         )
+    }
+
+    private func hasAgentsInstructions(in directory: URL) -> Bool {
+        ["AGENTS.md", "agents.md"].contains { filename in
+            let fileURL = directory.appendingPathComponent(filename)
+            var isDirectory: ObjCBool = false
+            return fileManager.fileExists(atPath: fileURL.path, isDirectory: &isDirectory)
+                && !isDirectory.boolValue
+        }
     }
 
     private func runGit(_ arguments: [String], in directory: URL) -> CommandResult {
@@ -944,6 +1311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         card.snapshot = snapshot
         card.latestArtifact = artifact
         card.titleLabel.stringValue = "\(card.project.name)   версия \(snapshot.version)"
+        card.agentsIndicator.isHidden = snapshot.hasAgentsInstructions
 
         if !snapshot.isRepository {
             card.gitLabel.stringValue = snapshot.error ?? "Git недоступен"
@@ -953,7 +1321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if snapshot.changedFiles == 0 {
                 parts.append("clean")
             } else {
-                parts.append("dirty: \(snapshot.changedFiles)")
+                parts.append("незакоммичено: \(snapshot.changedFiles)")
             }
 
             if !snapshot.hasOrigin {
@@ -979,19 +1347,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        updateOriginCommitIndicator(snapshot, for: card)
         updateActionAvailability()
+    }
+
+    private func updateOriginCommitIndicator(_ snapshot: GitSnapshot, for card: ProjectCard) {
+        let label = card.originCommitLabel
+        label.layer?.removeAnimation(forKey: "originCommitAhead")
+        label.layer?.opacity = 1
+
+        guard snapshot.isRepository, let originCommitDate = snapshot.originCommitDate else {
+            label.isHidden = true
+            return
+        }
+
+        label.isHidden = false
+        label.stringValue = "Origin: \(originCommitDateFormatter.string(from: originCommitDate))"
+
+        // This is the date of the latest commit in upstream, not the time of
+        // the last Push operation. Highlight it only when local commits are ahead.
+        guard snapshot.ahead > 0 else {
+            label.textColor = .tertiaryLabelColor
+            return
+        }
+
+        label.textColor = .systemRed
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1
+        pulse.toValue = 0.3
+        pulse.duration = 1.4
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        label.layer?.add(pulse, forKey: "originCommitAhead")
     }
 
     private func updateLastOperation(
         _ card: ProjectCard,
         kind: OperationKind,
-        succeeded: Bool,
-        duration: TimeInterval
+        outcome: OperationOutcome,
+        duration: TimeInterval,
+        completedAt: Date
     ) {
-        let result = succeeded ? "успех" : "ошибка"
         card.lastOperationLabel.stringValue =
-            "Последняя: \(kind.title) — \(result) · \(formatDuration(duration))"
-        card.lastOperationLabel.textColor = succeeded ? .systemGreen : .systemRed
+            "Последняя: \(kind.title) — \(outcome.title) · \(formatDuration(duration))"
+        switch outcome {
+        case .succeeded:
+            card.lastOperationLabel.textColor = .systemGreen
+        case .failed:
+            card.lastOperationLabel.textColor = .systemRed
+        case .skipped:
+            card.lastOperationLabel.textColor = .secondaryLabelColor
+        }
+        card.lastOperationDateLabel.stringValue = lastOperationDateFormatter.string(from: completedAt)
+        card.lastOperationDateLabel.isHidden = false
+        card.lastOperationDateLabel.textColor = .tertiaryLabelColor
     }
 
     private func setBusy(_ busy: Bool, status: String) {
@@ -1003,6 +1413,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             progressIndicator.stopAnimation(nil)
         }
         updateActionAvailability()
+    }
+
+    private func registerZoomable(_ control: NSControl) {
+        guard let font = control.font else { return }
+        zoomableControls.append((control, font))
+    }
+
+    private func registerZoomable(_ textView: NSTextView) {
+        guard let font = textView.font else { return }
+        zoomableTextViews.append((textView, font))
+    }
+
+    private func installZoomKeyboardShortcuts() {
+        zoomEventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.window.isKeyWindow else { return event }
+
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard modifiers.contains(.command),
+                  !modifiers.contains(.control),
+                  !modifiers.contains(.option) else {
+                return event
+            }
+
+            switch event.keyCode {
+            case 24: // = / +
+                self.changeInterfaceZoom(by: self.interfaceZoomStep)
+                return nil
+            case 27: // - / _
+                self.changeInterfaceZoom(by: -self.interfaceZoomStep)
+                return nil
+            case 29: // 0
+                self.setInterfaceZoom(1)
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func changeInterfaceZoom(by delta: CGFloat) {
+        setInterfaceZoom(interfaceZoom + delta)
+    }
+
+    private func setInterfaceZoom(_ requestedZoom: CGFloat) {
+        let roundedZoom = (requestedZoom / interfaceZoomStep).rounded() * interfaceZoomStep
+        let newZoom = min(max(roundedZoom, minimumInterfaceZoom), maximumInterfaceZoom)
+        guard abs(newZoom - interfaceZoom) > 0.001 else { return }
+
+        interfaceZoom = newZoom
+        for (control, baseFont) in zoomableControls {
+            control.font = baseFont.withSize(baseFont.pointSize * newZoom)
+        }
+        for (textView, baseFont) in zoomableTextViews {
+            textView.font = baseFont.withSize(baseFont.pointSize * newZoom)
+        }
+        for card in cards {
+            card.heightConstraint.constant = 64 * newZoom
+        }
+        projectStack.spacing = 8 * newZoom
+        window.contentView?.needsLayout = true
+        window.contentView?.layoutSubtreeIfNeeded()
+
+        setStatus("Масштаб: \(Int((newZoom * 100).rounded()))%", color: .secondaryLabelColor)
     }
 
     private func finishBusyState() {
@@ -1096,8 +1569,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || haystack.contains("is the docker daemon running") {
             return "Docker не запущен или недоступен."
         }
-        if operation == .build || operation == .pushAndBuild {
+        if operation == .build {
             return "Сборка завершилась с ошибкой."
+        }
+        if operation == .pushAndBuild {
+            return "Одна из команд Push или Build завершилась с ошибкой."
         }
         return "Команда завершилась с ошибкой."
     }
