@@ -84,6 +84,7 @@ plutil -lint projects.json
 {
   "name": "Название в UI",
   "path": "/абсолютный/путь/к/проекту",
+  "pushBranch": "main",
   "pushRecipe": "just-рецепт-push",
   "buildRecipe": "just-рецепт-build",
   "buildLabel": "Подпись кнопки",
@@ -92,6 +93,8 @@ plutil -lint projects.json
 ```
 
 - `path` — абсолютный путь к локальному проекту.
+- `pushBranch` — единственная ветка, из которой Project Center разрешает
+  Commit/Push; обычно `main`.
 - Имена рецептов должны существовать в общем
   `~/My soft/justfile`.
 - `artifactPaths` задаются относительно `path`, но абсолютные пути также

@@ -4,6 +4,7 @@ import QuartzCore
 private struct ProjectDefinition: Decodable {
     let name: String
     let path: String
+    let pushBranch: String
     let pushRecipe: String
     let buildRecipe: String
     let buildLabel: String
@@ -16,12 +17,15 @@ private struct GitSnapshot {
     let branch: String
     let isDetached: Bool
     let changedFiles: Int
+    let untrackedFiles: [String]
+    let hasConflicts: Bool
     let hasCommit: Bool
     let hasOrigin: Bool
     let upstream: String?
     let ahead: Int
     let behind: Int
     let originCommitDate: Date?
+    let originRefreshError: String?
     let version: String
     let error: String?
 }
@@ -65,6 +69,12 @@ private enum OperationOutcome: Equatable {
         case .skipped: return "не выполнено"
         }
     }
+}
+
+private enum AutomaticCommitOutcome {
+    case ready
+    case cancelled(String)
+    case failed(String)
 }
 
 private final class ProjectCard {
@@ -345,7 +355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         registerZoomable(title)
         headingStack.addArrangedSubview(title)
 
-        let subtitle = NSTextField(labelWithString: "Push автоматически фиксирует все изменения · без force · сборки через общий justfile")
+        let subtitle = NSTextField(labelWithString: "Commit/Push — только в целевую ветку · origin проверяется перед отправкой · без force")
         subtitle.textColor = .secondaryLabelColor
         subtitle.font = .systemFont(ofSize: 12)
         registerZoomable(subtitle)
@@ -369,6 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
 
         refreshButton = NSButton(title: "Обновить", target: self, action: #selector(refreshStatuses(_:)))
         refreshButton.bezelStyle = .rounded
+        refreshButton.bezelColor = .systemBlue
         registerZoomable(refreshButton)
         header.addArrangedSubview(refreshButton)
 
@@ -630,23 +641,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
 
         row.addArrangedSubview(NSView())
 
-        let pushButton = actionButton(title: "Commit + Push", selector: #selector(pushProject(_:)), index: index)
-        pushButton.contentTintColor = .systemOrange
+        let pushButton = actionButton(
+            title: "Commit + Push → \(project.pushBranch)",
+            selector: #selector(pushProject(_:)),
+            index: index,
+            color: .systemOrange
+        )
         pushButton.toolTip = "Зафиксировать все изменения и отправить их в origin"
         row.addArrangedSubview(pushButton)
 
-        let buildButton = actionButton(title: project.buildLabel, selector: #selector(buildProject(_:)), index: index)
+        let buildButton = actionButton(
+            title: project.buildLabel,
+            selector: #selector(buildProject(_:)),
+            index: index,
+            color: .systemBlue
+        )
         row.addArrangedSubview(buildButton)
 
-        let combinedButton = actionButton(title: "Build + Commit + Push", selector: #selector(pushAndBuildProject(_:)), index: index)
+        let combinedButton = actionButton(
+            title: "Build + Commit + Push → \(project.pushBranch)",
+            selector: #selector(pushAndBuildProject(_:)),
+            index: index,
+            color: .systemPurple
+        )
         combinedButton.toolTip = "Сначала собрать проект, затем зафиксировать все изменения и отправить их в origin"
         row.addArrangedSubview(combinedButton)
 
-        let launchButton = actionButton(title: "Запуск", selector: #selector(launchArtifact(_:)), index: index)
+        let launchButton = actionButton(
+            title: "Запуск",
+            selector: #selector(launchArtifact(_:)),
+            index: index,
+            color: .systemGreen
+        )
         launchButton.toolTip = "Запустить последнюю собранную версию"
         row.addArrangedSubview(launchButton)
 
-        let revealArtifactButton = actionButton(title: "Место", selector: #selector(revealArtifact(_:)), index: index)
+        let revealArtifactButton = actionButton(
+            title: "Место",
+            selector: #selector(revealArtifact(_:)),
+            index: index,
+            color: .systemTeal
+        )
         revealArtifactButton.toolTip = "Показать последнюю сборку в Finder"
         row.addArrangedSubview(revealArtifactButton)
 
@@ -670,9 +705,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         )
     }
 
-    private func actionButton(title: String, selector: Selector, index: Int) -> NSButton {
+    private func actionButton(
+        title: String,
+        selector: Selector,
+        index: Int,
+        color: NSColor
+    ) -> NSButton {
         let button = NSButton(title: title, target: self, action: selector)
         button.bezelStyle = .rounded
+        button.bezelColor = color
         button.controlSize = .small
         button.tag = index
         button.isEnabled = false
@@ -690,17 +731,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
 
         operationQueue.async { [weak self] in
             guard let self else { return }
-            let results = self.projects.map { project -> (GitSnapshot, URL?) in
-                let snapshot = self.readSnapshot(for: project)
+            let results = self.projects.map { project -> (GitSnapshot, URL?, Bool) in
+                let initialSnapshot = self.readSnapshot(for: project)
+                let fetchResult: CommandResult?
+                if initialSnapshot.isRepository && initialSnapshot.hasOrigin {
+                    fetchResult = self.fetchOrigin(for: project)
+                } else {
+                    fetchResult = nil
+                }
+
+                let fetchFailed = fetchResult.map { !$0.succeeded } ?? false
+                let snapshot = self.readSnapshot(
+                    for: project,
+                    originRefreshError: fetchFailed ? "не удалось обновить origin" : nil
+                )
                 let artifact = self.latestArtifact(for: project)
-                return (snapshot, artifact)
+                return (snapshot, artifact, fetchFailed)
             }
 
             DispatchQueue.main.async {
                 for (index, result) in results.enumerated() where index < self.cards.count {
                     self.apply(result.0, artifact: result.1, to: self.cards[index])
                 }
-                self.setBusy(false, status: "Статусы обновлены")
+                let failedProjects = zip(self.projects, results)
+                    .filter { $0.1.2 }
+                    .map { $0.0.name }
+                if failedProjects.isEmpty {
+                    self.setBusy(false, status: "Статусы и origin обновлены")
+                } else {
+                    self.setBusy(
+                        false,
+                        status: "Origin не обновлён: \(failedProjects.joined(separator: ", "))"
+                    )
+                    self.setStatus(
+                        "Origin не обновлён: \(failedProjects.joined(separator: ", "))",
+                        color: .systemOrange
+                    )
+                }
             }
         }
     }
@@ -765,59 +832,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             case .push:
                 var currentSnapshot = self.readSnapshot(for: card.project)
 
-                if let blockReason = self.pushBlockReason(for: currentSnapshot) {
+                if let blockReason = self.pushPrerequisiteBlockReason(
+                    for: currentSnapshot,
+                    project: card.project
+                ) {
                     message = blockReason
                     notes.append("Команда Push не была запущена.\nПричина: \(blockReason)")
                     outcome = .failed
-                } else if let commitFailure = self.createAutomaticCommitIfNeeded(
+                } else if let synchronizationFailure = self.refreshOriginForPush(
                     for: card.project,
-                    snapshot: currentSnapshot,
+                    snapshot: &currentSnapshot,
                     commandResults: &commandResults,
                     notes: &notes
                 ) {
-                    currentSnapshot = self.readSnapshot(for: card.project)
-                    message = commitFailure
+                    message = synchronizationFailure
                     outcome = .failed
                 } else {
-                    currentSnapshot = self.readSnapshot(for: card.project)
-
-                    let pushExecution = self.pushPendingCommits(
-                        for: card.project,
-                        snapshot: &currentSnapshot,
-                        commandResults: &commandResults,
-                        notes: &notes
-                    )
-                    outcome = pushExecution.outcome
-                    message = pushExecution.message
-                }
-
-                snapshot = currentSnapshot
-
-            case .pushAndBuild:
-                var currentSnapshot = self.readSnapshot(for: card.project)
-
-                if let blockReason = self.pushBlockReason(for: currentSnapshot) {
-                    message = blockReason
-                    notes.append("Команды Build, Commit и Push не были запущены.\nПричина: \(blockReason)")
-                    outcome = .failed
-                } else {
-                    notes.append("Порядок операции: Build → Commit → Push.")
-                    let buildResult = self.runJustRecipe(card.project.buildRecipe)
-                    commandResults.append(buildResult)
-                    currentSnapshot = self.readSnapshot(for: card.project)
-
-                    if !buildResult.succeeded {
-                        outcome = .failed
-                    } else if let commitFailure = self.createAutomaticCommitIfNeeded(
+                    switch self.createAutomaticCommitIfNeeded(
                         for: card.project,
                         snapshot: currentSnapshot,
                         commandResults: &commandResults,
                         notes: &notes
                     ) {
+                    case .failed(let commitFailure):
                         currentSnapshot = self.readSnapshot(for: card.project)
                         message = commitFailure
                         outcome = .failed
-                    } else {
+                    case .cancelled(let cancellationMessage):
+                        currentSnapshot = self.readSnapshot(for: card.project)
+                        message = cancellationMessage
+                        notes.append(cancellationMessage)
+                        outcome = .skipped
+                    case .ready:
                         currentSnapshot = self.readSnapshot(for: card.project)
                         let pushExecution = self.pushPendingCommits(
                             for: card.project,
@@ -825,13 +871,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
                             commandResults: &commandResults,
                             notes: &notes
                         )
+                        outcome = pushExecution.outcome
+                        message = pushExecution.message
+                    }
+                }
 
-                        if pushExecution.outcome == .skipped {
-                            notes.append("Сборка выполнена; новых коммитов для отправки нет.")
-                            outcome = .succeeded
-                        } else {
-                            outcome = pushExecution.outcome
-                            message = pushExecution.message
+                snapshot = currentSnapshot
+
+            case .pushAndBuild:
+                var currentSnapshot = self.readSnapshot(for: card.project)
+
+                if let blockReason = self.pushPrerequisiteBlockReason(
+                    for: currentSnapshot,
+                    project: card.project
+                ) {
+                    message = blockReason
+                    notes.append("Команды Build, Commit и Push не были запущены.\nПричина: \(blockReason)")
+                    outcome = .failed
+                } else if let synchronizationFailure = self.refreshOriginForPush(
+                    for: card.project,
+                    snapshot: &currentSnapshot,
+                    commandResults: &commandResults,
+                    notes: &notes
+                ) {
+                    message = synchronizationFailure
+                    outcome = .failed
+                } else {
+                    notes.append("Порядок операции: проверка origin → Build → повторная проверка origin → Commit → Push.")
+                    let buildResult = self.runJustRecipe(card.project.buildRecipe)
+                    commandResults.append(buildResult)
+                    currentSnapshot = self.readSnapshot(for: card.project)
+
+                    if !buildResult.succeeded {
+                        outcome = .failed
+                    } else if let synchronizationFailure = self.refreshOriginForPush(
+                        for: card.project,
+                        snapshot: &currentSnapshot,
+                        commandResults: &commandResults,
+                        notes: &notes
+                    ) {
+                        message = synchronizationFailure
+                        outcome = .failed
+                    } else {
+                        switch self.createAutomaticCommitIfNeeded(
+                            for: card.project,
+                            snapshot: currentSnapshot,
+                            commandResults: &commandResults,
+                            notes: &notes
+                        ) {
+                        case .failed(let commitFailure):
+                            currentSnapshot = self.readSnapshot(for: card.project)
+                            message = commitFailure
+                            outcome = .failed
+                        case .cancelled(let cancellationMessage):
+                            currentSnapshot = self.readSnapshot(for: card.project)
+                            message = cancellationMessage
+                            notes.append(cancellationMessage)
+                            outcome = .skipped
+                        case .ready:
+                            currentSnapshot = self.readSnapshot(for: card.project)
+                            let pushExecution = self.pushPendingCommits(
+                                for: card.project,
+                                snapshot: &currentSnapshot,
+                                commandResults: &commandResults,
+                                notes: &notes
+                            )
+
+                            if pushExecution.outcome == .skipped {
+                                notes.append("Сборка выполнена; новых коммитов для отправки нет.")
+                                outcome = .succeeded
+                            } else {
+                                outcome = pushExecution.outcome
+                                message = pushExecution.message
+                            }
                         }
                     }
                 }
@@ -924,7 +1036,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         )
     }
 
-    private func pushBlockReason(for snapshot: GitSnapshot) -> String? {
+    private func fetchOrigin(for project: ProjectDefinition) -> CommandResult {
+        runGit(
+            [
+                "-c", "credential.interactive=never",
+                "-c", "http.lowSpeedLimit=1",
+                "-c", "http.lowSpeedTime=15",
+                "fetch", "--prune", "origin"
+            ],
+            in: URL(fileURLWithPath: project.path, isDirectory: true)
+        )
+    }
+
+    private func refreshOriginForPush(
+        for project: ProjectDefinition,
+        snapshot: inout GitSnapshot,
+        commandResults: inout [CommandResult],
+        notes: inout [String]
+    ) -> String? {
+        notes.append("Обновляется origin перед Commit/Push, чтобы исключить работу по устаревшему состоянию.")
+        let fetchResult = fetchOrigin(for: project)
+        commandResults.append(fetchResult)
+
+        guard fetchResult.succeeded else {
+            snapshot = readSnapshot(
+                for: project,
+                originRefreshError: "не удалось обновить origin"
+            )
+            let message = "Commit и Push остановлены: не удалось обновить origin. Проверьте сеть и доступ к Git, затем повторите операцию."
+            notes.append(message)
+            return message
+        }
+
+        snapshot = readSnapshot(for: project)
+        if let blockReason = pushBlockReason(for: snapshot, project: project) {
+            notes.append("Commit и Push остановлены после обновления origin.\nПричина: \(blockReason)")
+            return blockReason
+        }
+
+        notes.append(
+            "Origin обновлён. Ветка \(snapshot.branch) синхронизирована с \(snapshot.upstream ?? "origin"): ↑\(snapshot.ahead) ↓\(snapshot.behind)."
+        )
+        return nil
+    }
+
+    private func pushPrerequisiteBlockReason(
+        for snapshot: GitSnapshot,
+        project: ProjectDefinition
+    ) -> String? {
         guard snapshot.isRepository else {
             return "Push недоступен: проект не является Git-репозиторием."
         }
@@ -937,17 +1096,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         guard snapshot.hasOrigin else {
             return "Push недоступен: не настроен remote origin."
         }
-        guard snapshot.upstream != nil else {
-            return "Push недоступен: для текущей ветки не настроен upstream."
+        guard !project.pushBranch.isEmpty else {
+            return "Push недоступен: в projects.json не задана целевая ветка."
+        }
+        guard snapshot.branch == project.pushBranch else {
+            return "Commit и Push заблокированы: сейчас открыта ветка «\(snapshot.branch)», а для \(project.name) разрешена только «\(project.pushBranch)». Project Center не переключает и не сливает ветки автоматически."
+        }
+
+        let expectedUpstream = "origin/\(project.pushBranch)"
+        guard let upstream = snapshot.upstream else {
+            return "Push недоступен: для ветки «\(project.pushBranch)» не настроен upstream «\(expectedUpstream)»."
+        }
+        guard upstream == expectedUpstream else {
+            return "Push заблокирован: ветка «\(project.pushBranch)» отслеживает «\(upstream)» вместо «\(expectedUpstream)»."
+        }
+        if let originRefreshError = snapshot.originRefreshError {
+            return "Push временно заблокирован: \(originRefreshError). Нажмите «Обновить» и повторите проверку."
         }
         return nil
     }
 
-    private func pushPreparationNote(for snapshot: GitSnapshot) -> String {
+    private func pushSynchronizationBlockReason(
+        for snapshot: GitSnapshot,
+        project: ProjectDefinition
+    ) -> String? {
+        if snapshot.hasConflicts {
+            return "Commit и Push заблокированы: в рабочем дереве есть неразрешённые Git-конфликты."
+        }
+        if snapshot.ahead > 0 && snapshot.behind > 0 {
+            return "Push заблокирован: локальная «\(project.pushBranch)» и «origin/\(project.pushBranch)» разошлись (↑\(snapshot.ahead) ↓\(snapshot.behind)). Сначала разберите расхождение вручную."
+        }
+        if snapshot.behind > 0 {
+            return "Push заблокирован: «origin/\(project.pushBranch)» опережает локальную ветку на \(snapshot.behind) коммитов. Сначала безопасно обновите локальную «\(project.pushBranch)»."
+        }
+        return nil
+    }
+
+    private func pushBlockReason(
+        for snapshot: GitSnapshot,
+        project: ProjectDefinition
+    ) -> String? {
+        pushPrerequisiteBlockReason(for: snapshot, project: project)
+            ?? pushSynchronizationBlockReason(for: snapshot, project: project)
+    }
+
+    private func pushPreparationNote(
+        for snapshot: GitSnapshot,
+        project: ProjectDefinition
+    ) -> String {
         let workingTreeStatus = snapshot.changedFiles == 0
             ? "clean"
             : "незакоммичено: \(snapshot.changedFiles)"
         var lines = [
+            "Целевая ветка: \(project.pushBranch) → origin/\(project.pushBranch).",
             "Актуальный Git-статус перед Push: \(workingTreeStatus), ↑\(snapshot.ahead) ↓\(snapshot.behind).",
             "Будут отправлены только \(snapshot.ahead) готовых коммитов."
         ]
@@ -963,6 +1164,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         commandResults: inout [CommandResult],
         notes: inout [String]
     ) -> (outcome: OperationOutcome, message: String?) {
+        if let blockReason = pushBlockReason(for: snapshot, project: project) {
+            notes.append("Push остановлен перед запуском.\nПричина: \(blockReason)")
+            return (.failed, blockReason)
+        }
+
         guard snapshot.ahead > 0 else {
             let message: String
             if snapshot.behind > 0 {
@@ -974,13 +1180,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             return (.skipped, message)
         }
 
-        notes.append(pushPreparationNote(for: snapshot))
+        notes.append(pushPreparationNote(for: snapshot, project: project))
         let pushResult = runJustRecipe(project.pushRecipe)
         commandResults.append(pushResult)
         snapshot = readSnapshot(for: project)
 
         guard pushResult.succeeded else {
-            return (.failed, nil)
+            let refreshResult = fetchOrigin(for: project)
+            commandResults.append(refreshResult)
+            snapshot = readSnapshot(
+                for: project,
+                originRefreshError: refreshResult.succeeded ? nil : "не удалось повторно обновить origin"
+            )
+            if refreshResult.succeeded,
+               let synchronizationFailure = pushSynchronizationBlockReason(
+                   for: snapshot,
+                   project: project
+               ) {
+                notes.append("Origin изменился до завершения Push.\n\(synchronizationFailure)")
+                return (.failed, synchronizationFailure)
+            }
+            return (.failed, "Push завершился с ошибкой; рабочее дерево и история не изменялись автоматически.")
         }
         guard snapshot.upstream != nil else {
             let message = "Push завершился без ошибки, но после него не удалось определить upstream для проверки результата."
@@ -992,6 +1212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             notes.append(message)
             return (.failed, message)
         }
+        guard snapshot.behind == 0 else {
+            let message = "После Push локальная ветка отстаёт от origin на \(snapshot.behind) коммитов. Обновите статус и проверьте историю."
+            notes.append(message)
+            return (.failed, message)
+        }
         return (.succeeded, nil)
     }
 
@@ -1000,16 +1225,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         snapshot: GitSnapshot,
         commandResults: inout [CommandResult],
         notes: inout [String]
-    ) -> String? {
+    ) -> AutomaticCommitOutcome {
         guard snapshot.changedFiles > 0 else {
-            return nil
+            return .ready
+        }
+
+        if !snapshot.untrackedFiles.isEmpty,
+           !confirmAddingUntrackedFiles(for: project, snapshot: snapshot) {
+            return .cancelled("Commit и Push отменены: новые файлы не были подтверждены.")
         }
 
         notes.append("Подготовка автоматического коммита из \(snapshot.changedFiles) изменений.")
         let addResult = runGit(["add", "-A"], in: URL(fileURLWithPath: project.path, isDirectory: true))
         commandResults.append(addResult)
         guard addResult.succeeded else {
-            return "Не удалось добавить изменения в коммит. Push не выполнялся."
+            return .failed("Не удалось добавить изменения в коммит. Push не выполнялся.")
         }
 
         let commitMessage = "Автоматический коммит из Project Center"
@@ -1019,19 +1249,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
         )
         commandResults.append(commitResult)
         guard commitResult.succeeded else {
-            return "Не удалось создать коммит. Push не выполнялся."
+            return .failed("Не удалось создать коммит. Push не выполнялся.")
         }
 
         let updatedSnapshot = readSnapshot(for: project)
         guard updatedSnapshot.changedFiles == 0 else {
-            return "После автоматического коммита остались незакоммиченные изменения. Push не выполнялся."
+            return .failed("После автоматического коммита остались незакоммиченные изменения. Push не выполнялся.")
         }
 
         notes.append("Создан коммит: \(commitMessage).")
-        return nil
+        return .ready
     }
 
-    private func readSnapshot(for project: ProjectDefinition) -> GitSnapshot {
+    private func confirmAddingUntrackedFiles(
+        for project: ProjectDefinition,
+        snapshot: GitSnapshot
+    ) -> Bool {
+        let maximumVisibleFiles = 14
+        let visibleFiles = snapshot.untrackedFiles.prefix(maximumVisibleFiles).map {
+            $0.replacingOccurrences(of: "\n", with: "\\n")
+        }
+        var fileList = visibleFiles.map { "• \($0)" }.joined(separator: "\n")
+        if snapshot.untrackedFiles.count > maximumVisibleFiles {
+            fileList += "\n• …и ещё \(snapshot.untrackedFiles.count - maximumVisibleFiles)"
+        }
+
+        let presentAlert = {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Добавить новые файлы в коммит?"
+            alert.informativeText = "Проект: \(project.name)\nВетка: \(project.pushBranch) → origin/\(project.pushBranch)\n\nProject Center собирается выполнить git add -A. Новые файлы:\n\(fileList)\n\nПроверьте список: случайные файлы тоже попадут в Git."
+            alert.addButton(withTitle: "Добавить и продолжить")
+            alert.addButton(withTitle: "Отмена")
+            return alert.runModal() == .alertFirstButtonReturn
+        }
+
+        if Thread.isMainThread {
+            return presentAlert()
+        }
+        return DispatchQueue.main.sync(execute: presentAlert)
+    }
+
+    private func readSnapshot(
+        for project: ProjectDefinition,
+        originRefreshError: String? = nil
+    ) -> GitSnapshot {
         let directory = URL(fileURLWithPath: project.path, isDirectory: true)
         guard fileManager.fileExists(atPath: directory.path) else {
             return GitSnapshot(
@@ -1040,12 +1302,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
                 branch: "путь не найден",
                 isDetached: false,
                 changedFiles: 0,
+                untrackedFiles: [],
+                hasConflicts: false,
                 hasCommit: false,
                 hasOrigin: false,
                 upstream: nil,
                 ahead: 0,
                 behind: 0,
                 originCommitDate: nil,
+                originRefreshError: nil,
                 version: "—",
                 error: "Папка проекта не найдена"
             )
@@ -1060,12 +1325,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
                 branch: "не Git-репозиторий",
                 isDetached: false,
                 changedFiles: 0,
+                untrackedFiles: [],
+                hasConflicts: false,
                 hasCommit: false,
                 hasOrigin: false,
                 upstream: nil,
                 ahead: 0,
                 behind: 0,
                 originCommitDate: nil,
+                originRefreshError: nil,
                 version: detectVersion(in: directory),
                 error: "Не Git-репозиторий"
             )
@@ -1087,8 +1355,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
             in: directory
         )
-        let changedFiles = statusResult.output
+        let statusEntries = statusResult.output
             .split(separator: "\0", omittingEmptySubsequences: true)
+        let changedFiles = statusEntries
             .filter { entry in
                 entry.hasPrefix("1 ")
                     || entry.hasPrefix("2 ")
@@ -1096,6 +1365,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
                     || entry.hasPrefix("? ")
             }
             .count
+        let untrackedFiles = statusEntries.compactMap { entry -> String? in
+            guard entry.hasPrefix("? ") else { return nil }
+            return String(entry.dropFirst(2))
+        }.sorted()
+        let hasConflicts = statusEntries.contains { $0.hasPrefix("u ") }
 
         let originResult = runGit(["remote", "get-url", "origin"], in: directory)
         let hasOrigin = originResult.succeeded
@@ -1135,12 +1409,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             branch: branch,
             isDetached: isDetached,
             changedFiles: changedFiles,
+            untrackedFiles: untrackedFiles,
+            hasConflicts: hasConflicts,
             hasCommit: hasCommit,
             hasOrigin: hasOrigin,
             upstream: upstream,
             ahead: ahead,
             behind: behind,
             originCommitDate: originCommitDate,
+            originRefreshError: originRefreshError,
             version: detectVersion(in: directory),
             error: nil
         )
@@ -1317,7 +1594,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             card.gitLabel.stringValue = snapshot.error ?? "Git недоступен"
             card.gitLabel.textColor = .systemRed
         } else {
-            var parts = [snapshot.branch]
+            var parts: [String] = []
+            if snapshot.branch != card.project.pushBranch {
+                parts.append("Push заблокирован: нужна \(card.project.pushBranch)")
+            } else if snapshot.hasConflicts {
+                parts.append("Push заблокирован: есть конфликты")
+            } else if snapshot.ahead > 0 && snapshot.behind > 0 {
+                parts.append("Push заблокирован: ветки разошлись")
+            } else if snapshot.behind > 0 {
+                parts.append("Push заблокирован: origin впереди")
+            } else if snapshot.originRefreshError != nil {
+                parts.append("Push заблокирован: origin не обновлён")
+            }
+
+            parts.append(snapshot.branch)
             if snapshot.changedFiles == 0 {
                 parts.append("clean")
             } else {
@@ -1336,9 +1626,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
             if !snapshot.hasCommit {
                 parts.append("коммитов: нет")
             }
+            if snapshot.hasConflicts {
+                parts.append("конфликты")
+            }
 
             card.gitLabel.stringValue = parts.joined(separator: "  ·  ")
-            if !snapshot.hasOrigin || snapshot.isDetached || !snapshot.hasCommit {
+            if !snapshot.hasOrigin
+                || snapshot.isDetached
+                || !snapshot.hasCommit
+                || snapshot.hasConflicts
+                || snapshot.behind > 0
+                || snapshot.branch != card.project.pushBranch
+                || snapshot.originRefreshError != nil {
                 card.gitLabel.textColor = .systemOrange
             } else if snapshot.changedFiles > 0 {
                 card.gitLabel.textColor = .systemYellow
@@ -1346,6 +1645,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
                 card.gitLabel.textColor = .secondaryLabelColor
             }
         }
+        card.gitLabel.toolTip = pushBlockReason(for: snapshot, project: card.project)
+            ?? card.gitLabel.stringValue
 
         updateOriginCommitIndicator(snapshot, for: card)
         updateActionAvailability()
@@ -1487,14 +1788,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSSplitViewDelegate {
     private func updateActionAvailability() {
         refreshButton?.isEnabled = !isBusy
         for card in cards {
-            // All project actions stay available when the app is idle. Their
-            // handlers validate Git and artifact prerequisites and report a
-            // specific problem, rather than leaving buttons mysteriously dimmed.
-            card.pushButton.isEnabled = !isBusy
-            card.buildButton.isEnabled = !isBusy
-            card.pushAndBuildButton.isEnabled = !isBusy
-            card.launchButton.isEnabled = !isBusy
-            card.revealArtifactButton.isEnabled = !isBusy
+            let projectDirectoryExists = fileManager.fileExists(atPath: card.project.path)
+            let pushBlockReason = card.snapshot.flatMap {
+                self.pushBlockReason(for: $0, project: card.project)
+            }
+            let pushAvailable = card.snapshot != nil && pushBlockReason == nil
+            let artifactAvailable = card.latestArtifact != nil
+
+            card.pushButton.isEnabled = !isBusy && pushAvailable
+            card.buildButton.isEnabled = !isBusy && projectDirectoryExists
+            card.pushAndBuildButton.isEnabled = !isBusy && projectDirectoryExists && pushAvailable
+            card.launchButton.isEnabled = !isBusy && artifactAvailable
+            card.revealArtifactButton.isEnabled = !isBusy && artifactAvailable
+
+            if let pushBlockReason {
+                card.pushButton.toolTip = pushBlockReason
+                card.pushAndBuildButton.toolTip = pushBlockReason
+            } else {
+                let target = "\(card.project.pushBranch) → origin/\(card.project.pushBranch)"
+                card.pushButton.toolTip = "Зафиксировать все изменения и отправить только \(target)"
+                card.pushAndBuildButton.toolTip = "Проверить origin, собрать проект, затем зафиксировать изменения и отправить только \(target)"
+            }
+
+            if artifactAvailable {
+                card.launchButton.toolTip = "Запустить последнюю собранную версию"
+                card.revealArtifactButton.toolTip = "Показать последнюю сборку в Finder"
+            } else {
+                card.launchButton.toolTip = "Недоступно: готовая сборка не найдена"
+                card.revealArtifactButton.toolTip = "Недоступно: готовая сборка не найдена"
+            }
         }
     }
 
