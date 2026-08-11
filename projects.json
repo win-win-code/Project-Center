@@ -95,6 +95,17 @@
     ]
   },
   {
+    "name": "PrivateType",
+    "path": "/Users/ruslan_zeynalov/My soft/PrivateSwitch",
+    "pushBranch": "codex/stage-7-vertical-integration",
+    "pushRecipe": "privatetype-push",
+    "buildRecipe": "privatetype-release",
+    "buildLabel": "Собрать",
+    "artifactPaths": [
+      "Artifacts/PrivateType.app"
+    ]
+  },
+  {
     "name": "Project Manager",
     "path": "/Users/ruslan_zeynalov/My soft/Project Center",
     "pushBranch": "main",
