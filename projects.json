@@ -106,6 +106,15 @@
     ]
   },
   {
+    "name": "VoiceType",
+    "path": "/Users/ruslan_zeynalov/My soft/VoiceType",
+    "pushBranch": "agent/initial-voicetype",
+    "pushRecipe": "voicetype-push",
+    "buildRecipe": "voicetype-check",
+    "buildLabel": "Проверить",
+    "artifactPaths": []
+  },
+  {
     "name": "Project Manager",
     "path": "/Users/ruslan_zeynalov/My soft/Project Center",
     "pushBranch": "main",
